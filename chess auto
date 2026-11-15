@@ -1,0 +1,505 @@
+-- CHESS ENGINE v3 (color select + click-driven autoplay)
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local VIM = game:GetService("VirtualInputManager")
+local lp = Players.LocalPlayer
+local ps = lp.PlayerScripts
+
+local Engine = require(RS.Shared.Modules.Chess.Engine)
+local Search = require(RS.Shared.Modules.Chess.Search)
+local B = require(ps.Controllers.BoardController)
+
+if getgenv().ChessEngine and getgenv().ChessEngine.unload then pcall(getgenv().ChessEngine.unload) end
+
+local CFG = { depth = 9, maxTime = 1.2, playDelay = 0.4, key = getgenv().chessBind or Enum.KeyCode.F4 }
+getgenv().chessBind = CFG.key
+
+local ACCENT = Color3.fromRGB(45, 120, 90)
+local IDLE = Color3.fromRGB(32, 32, 36)
+local GREEN = Color3.fromRGB(80, 220, 130)
+local YELLOW = Color3.fromRGB(240, 200, 70)
+local GREY = Color3.fromRGB(150, 150, 160)
+
+local inset = GuiService:GetGuiInset()
+local solver = Search.new(20)
+local st = {
+  enabled = true, auto = false, thinking = false,
+  color = getgenv().chessColor,
+  mode = getgenv().chessClickMode or "click",
+  lastFen = nil, san = nil, uci = nil, score = 0, depth = 0, nodes = 0, mate = nil,
+  side = nil, pending = nil, awaitFen = nil, failUntil = 0,
+}
+local conns = {}
+local act = nil
+
+local function readPos()
+  local ok, p = pcall(B.position)
+  if ok and type(p) == "table" then return p end
+  return nil
+end
+
+local function readFen()
+  local p = readPos()
+  if not p then return nil end
+  local ok, f = pcall(Engine.toFen, p)
+  if ok and type(f) == "string" then return f end
+  return nil
+end
+
+local function getBoard()
+  local pg = lp:FindFirstChildOfClass("PlayerGui")
+  if not pg then return nil end
+  local g = pg:FindFirstChild("GameUI")
+  if not g then return nil end
+  local ok, b = pcall(function() return g.Root.Body.Center.BoardHolder.Face.Board end)
+  if ok then return b end
+  return nil
+end
+
+local function centerOf(o)
+  return o.AbsolutePosition.X + o.AbsoluteSize.X * 0.5, o.AbsolutePosition.Y + o.AbsoluteSize.Y * 0.5
+end
+
+local function moveMouse(x, y) VIM:SendMouseMoveEvent(x, y + inset.Y, game) end
+local function mouseDown(x, y) VIM:SendMouseButtonEvent(x, y + inset.Y, 0, true, game, 0) end
+local function mouseUp(x, y) VIM:SendMouseButtonEvent(x, y + inset.Y, 0, false, game, 0) end
+
+local function findMySide()
+  local okGC, GC = pcall(require, ps.Controllers.GameController)
+  if okGC and type(GC) == "table" then
+    for _, f in pairs(GC) do
+      if type(f) == "function" then
+        for i = 1, 60 do
+          local oku, v = pcall(debug.getupvalue, f, i)
+          if not oku then break end
+          if type(v) == "table" and rawget(v, "you") ~= nil and rawget(v, "startFen") ~= nil then
+            return v.you, v
+          end
+        end
+      end
+    end
+  end
+  local oko, o = pcall(B.orientation)
+  if oko and (o == 0 or o == 8) then return o, nil end
+  return nil, nil
+end
+
+local gd, gdAt = nil, 0
+local function getGameData()
+  local now = os.clock()
+  if gd and now - gdAt < 2 then return gd end
+  local _, found = findMySide()
+  gd, gdAt = found, now
+  return gd
+end
+
+local function inLiveGame()
+  local g = getGameData()
+  if not g then return false end
+  if g.watch then return false end
+  if g.you == nil then return false end
+  return true
+end
+
+if st.color ~= Engine.WHITE and st.color ~= Engine.BLACK then
+  local detected = findMySide()
+  st.color = (detected == Engine.WHITE or detected == Engine.BLACK) and detected or Engine.WHITE
+end
+getgenv().chessColor = st.color
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "FeralChess"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.Parent = lp:WaitForChild("PlayerGui")
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(236, 200)
+main.Position = UDim2.fromOffset(18, 18)
+main.BackgroundColor3 = Color3.fromRGB(17, 17, 20)
+main.BackgroundTransparency = 0.05
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+local stroke = Instance.new("UIStroke", main)
+stroke.Color = Color3.fromRGB(58, 58, 66)
+stroke.Thickness = 1
+stroke.Parent = main
+
+local function label(pos, size, text, textSize, color, bold)
+  local l = Instance.new("TextLabel")
+  l.BackgroundTransparency = 1
+  l.Position = pos
+  l.Size = size
+  l.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+  l.TextSize = textSize
+  l.TextColor3 = color
+  l.TextXAlignment = Enum.TextXAlignment.Left
+  l.Text = text
+  l.Parent = main
+  return l
+end
+
+local function button(pos, size, text, color)
+  local b = Instance.new("TextButton")
+  b.Position = pos
+  b.Size = size
+  b.BackgroundColor3 = color
+  b.BorderSizePixel = 0
+  b.Font = Enum.Font.GothamBold
+  b.TextSize = 10
+  b.TextColor3 = Color3.fromRGB(255, 255, 255)
+  b.Text = text
+  b.Parent = main
+  Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+  return b
+end
+
+local title = label(UDim2.fromOffset(12, 7), UDim2.new(1, -64, 0, 15), "CHESS ENGINE", 11, Color3.fromRGB(160, 160, 170), true)
+local tag = label(UDim2.new(1, -66, 0, 7), UDim2.fromOffset(54, 15), "ON", 10, GREEN, true)
+tag.TextXAlignment = Enum.TextXAlignment.Right
+
+local moveLbl = label(UDim2.fromOffset(12, 24), UDim2.new(1, -24, 0, 30), "--", 26, Color3.fromRGB(240, 240, 245), true)
+local subLbl = label(UDim2.fromOffset(12, 54), UDim2.new(1, -24, 0, 14), "reading board...", 10, Color3.fromRGB(130, 130, 140), false)
+local turnLbl = label(UDim2.fromOffset(12, 70), UDim2.new(1, -24, 0, 14), "", 10, GREY, true)
+local colorCap = label(UDim2.fromOffset(12, 90), UDim2.fromOffset(100, 12), "I AM PLAYING", 9, Color3.fromRGB(110, 110, 120), true)
+
+local whiteBtn = button(UDim2.fromOffset(12, 104), UDim2.fromOffset(102, 22), "WHITE", IDLE)
+local blackBtn = button(UDim2.fromOffset(122, 104), UDim2.fromOffset(102, 22), "BLACK", IDLE)
+local autoBtn = button(UDim2.fromOffset(12, 134), UDim2.new(1, -24, 0, 26), "AUTO-PLAY: OFF", IDLE)
+local playBtn = button(UDim2.fromOffset(12, 166), UDim2.new(1, -24, 0, 26), "PLAY MOVE", ACCENT)
+
+local function setSub(t) pcall(function() subLbl.Text = t end) end
+
+local function describe()
+  pcall(function()
+    if not st.enabled then
+      moveLbl.Text = "OFF"
+      moveLbl.TextColor3 = Color3.fromRGB(120, 120, 130)
+      tag.Text = "OFF"
+      tag.TextColor3 = GREY
+      turnLbl.Text = ""
+      return
+    end
+    tag.Text = act and "PLAYING" or (st.thinking and "THINK" or (st.auto and "AUTO" or "ON"))
+    tag.TextColor3 = (act or st.thinking) and YELLOW or (st.auto and YELLOW or GREEN)
+    if st.san then
+      moveLbl.Text = st.san
+      moveLbl.TextColor3 = Color3.fromRGB(240, 240, 245)
+    elseif st.thinking then
+      moveLbl.Text = "..."
+      moveLbl.TextColor3 = Color3.fromRGB(200, 200, 210)
+    else
+      moveLbl.Text = "--"
+      moveLbl.TextColor3 = Color3.fromRGB(140, 140, 150)
+    end
+    whiteBtn.BackgroundColor3 = st.color == Engine.WHITE and ACCENT or IDLE
+    blackBtn.BackgroundColor3 = st.color == Engine.BLACK and ACCENT or IDLE
+    whiteBtn.TextColor3 = st.color == Engine.WHITE and Color3.fromRGB(255, 255, 255) or GREY
+    blackBtn.TextColor3 = st.color == Engine.BLACK and Color3.fromRGB(255, 255, 255) or GREY
+    autoBtn.BackgroundColor3 = st.auto and Color3.fromRGB(150, 110, 40) or IDLE
+    autoBtn.Text = st.auto and "AUTO-PLAY: ON" or "AUTO-PLAY: OFF"
+    autoBtn.TextColor3 = st.auto and Color3.fromRGB(255, 235, 180) or GREY
+  end)
+end
+
+local dragging, dragStart, startPos
+main.InputBegan:Connect(function(input)
+  if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    dragging, dragStart, startPos = true, input.Position, main.Position
+  end
+end)
+table.insert(conns, UIS.InputChanged:Connect(function(input)
+  if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+    local d = input.Position - dragStart
+    main.Position = UDim2.fromOffset(startPos.X.Offset + d.X, startPos.Y.Offset + d.Y)
+  end
+end))
+table.insert(conns, UIS.InputEnded:Connect(function(input)
+  if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    dragging = false
+  end
+end))
+
+local function fmtEval(score, side, mate)
+  if mate then
+    if mate > 0 then return "M" .. mate end
+    return "M-" .. math.abs(mate)
+  end
+  local wp = side == Engine.WHITE and score or -score
+  local v = wp / 100
+  return (v >= 0 and "+" or "") .. string.format("%.2f", v)
+end
+
+local function buildSteps(a)
+  local b = getBoard()
+  if not b then return nil end
+  local fsq = b.Squares:FindFirstChild(a.from)
+  local tsq = b.Squares:FindFirstChild(a.to)
+  if not fsq or not tsq then return nil end
+  local fx, fy = centerOf(fsq)
+  local tx, ty = centerOf(tsq)
+  if a.mode == "drag" then
+    return {
+      {0.00, function() moveMouse(fx, fy) end},
+      {0.06, function() mouseDown(fx, fy) end},
+      {0.12, function() moveMouse(fx + (tx - fx) * 0.33, fy + (ty - fy) * 0.33) end},
+      {0.18, function() moveMouse(fx + (tx - fx) * 0.66, fy + (ty - fy) * 0.66) end},
+      {0.24, function() moveMouse(tx, ty) end},
+      {0.30, function() mouseUp(tx, ty) end},
+    }
+  end
+  return {
+    {0.00, function() moveMouse(fx, fy) end},
+    {0.05, function() mouseDown(fx, fy) end},
+    {0.10, function() mouseUp(fx, fy) end},
+    {0.22, function() moveMouse(tx, ty) end},
+    {0.27, function() mouseDown(tx, ty) end},
+    {0.32, function() mouseUp(tx, ty) end},
+  }
+end
+
+local function startPlay(uci, fen, mode)
+  if act then return end
+  local a = {
+    uci = uci, from = string.sub(uci, 1, 2), to = string.sub(uci, 3, 4),
+    mode = mode or st.mode, fenBefore = fen, t0 = os.clock(), i = 1,
+  }
+  a.steps = buildSteps(a)
+  if not a.steps then
+    setSub("board not ready")
+    return
+  end
+  act = a
+  st.awaitFen = fen
+  setSub("playing " .. uci)
+  describe()
+end
+
+local function tickAct(now)
+  if not act then return end
+  local a = act
+  while a.i <= #a.steps and (now - a.t0) >= a.steps[a.i][1] do
+    local okf, err = pcall(a.steps[a.i][2])
+    if not okf then warn("[Chess] input error: " .. tostring(err)) end
+    a.i = a.i + 1
+  end
+  if a.i <= #a.steps then return end
+  if now - a.t0 < 0.85 then return end
+
+  local b = getBoard()
+  local prom = b and b.Promotion
+  if prom and prom.Visible then
+    if a.promStage == nil then
+      local q = prom.Face:FindFirstChild("Q")
+      if q then
+        local qx, qy = centerOf(q)
+        moveMouse(qx, qy)
+        mouseDown(qx, qy)
+        a.promStage = 1
+        a.promAt = now + 0.06
+        return
+      end
+    elseif a.promStage == 1 and now >= (a.promAt or 0) then
+      local q = prom.Face:FindFirstChild("Q")
+      if q then
+        local qx, qy = centerOf(q)
+        mouseUp(qx, qy)
+      end
+      a.promStage = 2
+      a.t0 = now - 0.5
+      return
+    end
+    if a.promStage ~= 2 then return end
+  end
+
+  local fenNow = readFen()
+  if fenNow and fenNow ~= a.fenBefore then
+    st.awaitFen = nil
+    setSub("played " .. a.uci)
+    act = nil
+    describe()
+    return
+  end
+
+  if a.mode ~= "drag" and not a.retried then
+    a.retried = true
+    a.mode = "drag"
+    a.steps = buildSteps(a)
+    a.i = 1
+    a.t0 = now
+    setSub("retrying with drag")
+    return
+  end
+
+  act = nil
+  st.awaitFen = nil
+  st.failUntil = now + 3
+  setSub("click failed - try again")
+  describe()
+end
+
+local function solve()
+  if st.thinking then return end
+  local pos = readPos()
+  if not pos or pos.side ~= st.color then return end
+  local fen = readFen()
+  if not fen then return end
+  if Search.isBusy() then return end
+  st.thinking = true
+  describe()
+  local clone = Engine.clone(pos)
+  local ok, res = pcall(function()
+    return solver:think(clone, { maxDepth = CFG.depth, maxTime = CFG.maxTime })
+  end)
+  st.thinking = false
+  if not ok then
+    pcall(function() debug.setupvalue(Search.isBusy, 1, false) end)
+    setSub("search busy, retrying")
+    describe()
+    return false
+  end
+  if not res or not res.move or res.move == 0 then
+    setSub("no move")
+    describe()
+    return false
+  end
+  st.uci = Engine.uci(res.move)
+  st.san = tostring(Engine.san(clone, res.move))
+  st.score = res.score or 0
+  st.depth = res.depth or 0
+  st.nodes = res.nodes or 0
+  st.mate = res.mate
+  describe()
+  setSub(string.format("%s  d%d  %s", fmtEval(st.score, clone.side, st.mate), st.depth, st.nodes >= 1000 and string.format("%dk", math.floor(st.nodes / 1000)) or tostring(st.nodes)))
+  pcall(function()
+    turnLbl.Text = (st.color == Engine.WHITE and "WHITE" or "BLACK") .. "  -  YOUR TURN"
+    turnLbl.TextColor3 = Color3.fromRGB(90, 220, 140)
+    playBtn.BackgroundColor3 = ACCENT
+    playBtn.Text = "PLAY MOVE"
+  end)
+  pcall(B.clearArrows)
+  pcall(B.arrow, string.sub(st.uci, 1, 2), string.sub(st.uci, 3, 4), nil, 0.6)
+  return true
+end
+
+whiteBtn.MouseButton1Click:Connect(function()
+  st.color = Engine.WHITE
+  getgenv().chessColor = st.color
+  st.lastFen = nil
+  st.san, st.uci, st.pending = nil, nil, nil
+  describe()
+end)
+
+blackBtn.MouseButton1Click:Connect(function()
+  st.color = Engine.BLACK
+  getgenv().chessColor = st.color
+  st.lastFen = nil
+  st.san, st.uci, st.pending = nil, nil, nil
+  describe()
+end)
+
+autoBtn.MouseButton1Click:Connect(function()
+  st.auto = not st.auto
+  st.lastFen = nil
+  st.pending = nil
+  describe()
+  if st.auto then setSub("auto-play on") else setSub("auto-play off") end
+end)
+
+playBtn.MouseButton1Click:Connect(function()
+  if act then setSub("already playing") return end
+  local pos = readPos()
+  if not pos or pos.side ~= st.color then setSub("not your turn") return end
+  if not inLiveGame() then setSub("not in a game") return end
+  local fen = readFen()
+  if not fen then return end
+  if not st.uci then
+    if not solve() then return end
+  end
+  startPlay(st.uci, fen, st.mode)
+end)
+
+table.insert(conns, UIS.InputBegan:Connect(function(input, gp)
+  if gp then return end
+  if input.KeyCode == CFG.key then
+    st.enabled = not st.enabled
+    if not st.enabled then
+      pcall(B.clearArrows)
+      act = nil
+      st.pending = nil
+    end
+    describe()
+  end
+end))
+
+local lastPoll = 0
+table.insert(conns, RunService.Heartbeat:Connect(function()
+  local now = os.clock()
+  tickAct(now)
+  if now - lastPoll < 0.25 then return end
+  lastPoll = now
+  if not st.enabled then return end
+  if act then return end
+
+  local fen = readFen()
+  if not fen then setSub("no board") return end
+  if fen ~= st.lastFen then
+    st.lastFen = fen
+    st.san, st.uci, st.pending = nil, nil, nil
+    describe()
+    local pos = readPos()
+    st.side = pos and pos.side or nil
+    local mine = st.side == st.color
+    if not mine then
+      pcall(B.clearArrows)
+      setSub(st.auto and "waiting for opponent..." or "not your move")
+      pcall(function()
+        turnLbl.Text = (st.side == Engine.WHITE and "WHITE" or "BLACK") .. " to move  -  waiting"
+        turnLbl.TextColor3 = GREY
+        playBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+        playBtn.Text = "NOT YOUR TURN"
+      end)
+    elseif not inLiveGame() then
+      pcall(B.clearArrows)
+      setSub("not in a game")
+      pcall(function()
+        turnLbl.Text = "no active game"
+        turnLbl.TextColor3 = GREY
+        playBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+        playBtn.Text = "NOT IN GAME"
+      end)
+    else
+      if solve() and st.auto and st.uci and now >= st.failUntil then
+        st.pending = { uci = st.uci, fen = fen, at = now + CFG.playDelay }
+      end
+    end
+  end
+
+  if st.pending and now >= st.pending.at then
+    local p = st.pending
+    st.pending = nil
+    if readFen() == p.fen then
+      startPlay(p.uci, p.fen, st.mode)
+    end
+  end
+end))
+
+function st.unload()
+  for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+  conns = {}
+  act = nil
+  pcall(B.clearArrows)
+  if gui then gui:Destroy() gui = nil end
+  if getgenv().ChessEngine == st then getgenv().ChessEngine = nil end
+  print("[Chess] unloaded")
+end
+
+getgenv().ChessEngine = st
+describe()
+print("[Chess] loaded | color " .. (st.color == Engine.WHITE and "WHITE" or "BLACK") .. " | depth " .. CFG.depth .. " | click mode " .. st.mode .. " | key " .. CFG.key.Name)
+print("[Chess] fen: " .. tostring(readFen()))
+print("[Chess] in live game: " .. tostring(inLiveGame()))
