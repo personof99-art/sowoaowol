@@ -1,0 +1,776 @@
+--[[
+    Feral Hub
+    ---------
+    Chams (players = orange, NPCs = red) with name/age labels
+    + Kill Aura, wrapped in a clean toggleable menu.
+
+    Menu toggle: RightControl
+    API: _G.FeralHub  { Config, Stats, SetEnabled, Toggle, Destroy }
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local WolfActions = ReplicatedStorage:WaitForChild("WolfActions", 10)
+
+local okSpecies, Species = pcall(function()
+    return require(ReplicatedStorage:WaitForChild("FeralWorld"):WaitForChild("Species"))
+end)
+if not okSpecies then Species = nil end
+
+if not Drawing then
+    error("[FeralHub] Drawing library is not available in this executor")
+end
+
+--=============================================================
+-- Config / State
+--=============================================================
+
+local Hub = {}
+
+Hub.Config = {
+    ESP = {
+        Enabled = true,
+        MaxHighlights = 31,
+        FillTransparency = 0.55,
+        OutlineTransparency = 0,
+        PlayerBias = 0.75,
+        ShowLabels = true,
+        ShowAge = true,
+        ShowDistance = true,
+        TextSize = 14,
+        Font = Drawing.Fonts.Plex,
+        Categories = {
+            Players  = { enabled = true, maxDistance = 2000, color = Color3.fromRGB(255, 150, 40) },
+            Animals  = { enabled = true, maxDistance = 1200, color = Color3.fromRGB(255, 55, 55) },
+            Critters = { enabled = true, maxDistance = 350,  color = Color3.fromRGB(255, 55, 55) },
+            Fish     = { enabled = false, maxDistance = 350, color = Color3.fromRGB(255, 55, 55) },
+        },
+    },
+    Aura = {
+        Enabled = false,
+        Range = 18,
+        TargetPlayers = false,
+        TargetNPCs = true,
+    },
+}
+
+Hub.Stats = { targets = 0, chams = 0, auraHits = 0 }
+
+local CATEGORY_FOLDERS = {
+    { category = "Animals",  folders = { "FeralNPCs" } },
+    { category = "Critters", folders = { "FeralMice", "FeralCrows", "FeralCritters" } },
+    { category = "Fish",     folders = { "FeralFishLocal" } },
+}
+
+-- ESP internals
+local candidates, candidatesAt = {}, 0
+local assigned, chamPool = {}, {}
+local labels, seen = {}, {}
+
+-- runtime
+local connections = {}
+local running = false
+local lastBite = 0
+local auraAccum = 0
+
+--=============================================================
+-- Drawing helpers
+--=============================================================
+
+local function newDrawing(class, props)
+    local d = Drawing.new(class)
+    for k, v in pairs(props) do d[k] = v end
+    return d
+end
+
+local function partsOf(model, entry)
+    local parts = entry.parts
+    local now = os.clock()
+    if now - entry.partsAt > 0.75 or #parts == 0 then
+        entry.partsAt = now
+        local list = {}
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("BasePart") and d.Transparency < 0.97 then
+                list[#list + 1] = d
+            end
+        end
+        entry.parts = list
+        return list
+    end
+    return parts
+end
+
+local function worldBounds(parts)
+    local minx, miny, minz = math.huge, math.huge, math.huge
+    local maxx, maxy, maxz = -math.huge, -math.huge, -math.huge
+    for _, p in ipairs(parts) do
+        local cf, sz = p.CFrame, p.Size
+        local hx, hy, hz = sz.X * 0.5, sz.Y * 0.5, sz.Z * 0.5
+        for ix = -1, 1, 2 do
+            for iy = -1, 1, 2 do
+                for iz = -1, 1, 2 do
+                    local w = cf * Vector3.new(hx * ix, hy * iy, hz * iz)
+                    if w.X < minx then minx = w.X end
+                    if w.Y < miny then miny = w.Y end
+                    if w.Z < minz then minz = w.Z end
+                    if w.X > maxx then maxx = w.X end
+                    if w.Y > maxy then maxy = w.Y end
+                    if w.Z > maxz then maxz = w.Z end
+                end
+            end
+        end
+    end
+    return Vector3.new(minx, miny, minz), Vector3.new(maxx, maxy, maxz)
+end
+
+local function ageOf(inst)
+    if not Hub.Config.ESP.ShowAge then return nil end
+    local stage = inst and inst:GetAttribute("AgeStage")
+    if stage and stage ~= "" then return stage end
+    return nil
+end
+
+local function playerLabel(plr)
+    local char = plr.Character
+    local species = (char and char:GetAttribute("Species")) or "?"
+    local name = char and char:GetAttribute("FeralName")
+    if not name or name == "" then
+        name = plr.DisplayName ~= "" and plr.DisplayName or plr.Name
+    end
+    local bits = { name, species }
+    local age = ageOf(char)
+    if age then bits[#bits + 1] = age end
+    return table.concat(bits, " · ")
+end
+
+local function npcLabel(model)
+    local species = model:GetAttribute("Species")
+    if not species or species == "" then
+        species = (model.Name:gsub("_%a+$", ""))
+    end
+    local age = ageOf(model)
+    if age then return species .. " · " .. age end
+    return species
+end
+
+--=============================================================
+-- Cham pool
+--=============================================================
+
+local function takeCham()
+    local h = table.remove(chamPool)
+    if not h then
+        h = Instance.new("Highlight")
+        h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        h.Name = "FeralCham"
+    end
+    return h
+end
+
+local function releaseCham(model)
+    local h = assigned[model]
+    if not h then return end
+    assigned[model] = nil
+    h.Adornee = nil
+    h.Parent = nil
+    chamPool[#chamPool + 1] = h
+end
+
+local function releaseAllChams()
+    for model in pairs(assigned) do releaseCham(model) end
+end
+
+local function applyCham(model, color)
+    local cfg = Hub.Config.ESP
+    local h = assigned[model]
+    if not h then
+        h = takeCham()
+        assigned[model] = h
+        h.Parent = model
+    end
+    h.Adornee = model
+    h.FillColor = color
+    h.FillTransparency = cfg.FillTransparency
+    h.OutlineColor = color
+    h.OutlineTransparency = cfg.OutlineTransparency
+    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    h.Enabled = true
+end
+
+--=============================================================
+-- Labels
+--=============================================================
+
+local function labelFor(model)
+    local e = labels[model]
+    if not e then
+        e = { parts = {}, partsAt = 0, nameText = nil, distText = nil, lastLabel = nil, lastDist = nil, distAt = 0, shown = false }
+        labels[model] = e
+    end
+    if not e.nameText then
+        local cfg = Hub.Config.ESP
+        e.nameText = newDrawing("Text", { Text = "", Size = cfg.TextSize, Font = cfg.Font, Center = true, Outline = true, OutlineColor = Color3.new(0,0,0), Visible = false })
+        e.distText = newDrawing("Text", { Text = "", Size = cfg.TextSize - 1, Font = cfg.Font, Center = true, Outline = true, OutlineColor = Color3.new(0,0,0), Color = Color3.fromRGB(215,215,220), Visible = false })
+    end
+    return e
+end
+
+local function hideLabel(e)
+    if not e.shown then return end
+    e.shown = false
+    if e.nameText then e.nameText.Visible = false end
+    if e.distText then e.distText.Visible = false end
+end
+
+local function drawLabel(c, now, camera)
+    local cfg = Hub.Config.ESP
+    local e = labelFor(c.model)
+    local parts = partsOf(c.model, e)
+    if #parts == 0 then hideLabel(e) return end
+
+    local mn, mx = worldBounds(parts)
+    local top = Vector3.new((mn.X + mx.X) * 0.5, mx.Y, (mn.Z + mx.Z) * 0.5)
+    local sp = camera:WorldToViewportPoint(top)
+    if sp.Z <= 0 then hideLabel(e) return end
+
+    if cfg.ShowLabels then
+        if e.lastLabel ~= c.label then
+            e.lastLabel = c.label
+            e.nameText.Text = c.label
+            e.nameText.Size = cfg.TextSize
+        end
+        e.nameText.Color = c.color
+        e.nameText.Position = Vector2.new(sp.X, sp.Y - cfg.TextSize - 4)
+        e.nameText.Visible = true
+
+        if cfg.ShowDistance then
+            if now - e.distAt > 0.1 then
+                e.distAt = now
+                local text = string.format("%d studs", math.floor(c.dist + 0.5))
+                if text ~= e.lastDist then
+                    e.lastDist = text
+                    e.distText.Text = text
+                end
+            end
+            e.distText.Position = Vector2.new(sp.X, sp.Y - 2)
+            e.distText.Visible = true
+        else
+            e.distText.Visible = false
+        end
+        e.shown = true
+    else
+        hideLabel(e)
+    end
+end
+
+local function pruneLabels()
+    for model, e in pairs(labels) do
+        if not seen[model] then
+            hideLabel(e)
+            if e.nameText then e.nameText:Remove() end
+            if e.distText then e.distText:Remove() end
+            labels[model] = nil
+        end
+    end
+end
+
+--=============================================================
+-- ESP collection
+--=============================================================
+
+local function collectCandidates(now)
+    candidatesAt = now
+    candidates = {}
+    seen = {}
+    local cfg = Hub.Config.ESP
+
+    local camPos = Workspace.CurrentCamera and Workspace.CurrentCamera.CFrame.Position
+    if not camPos then return end
+
+    local function push(model, kind, label)
+        if seen[model] then return end
+        seen[model] = true
+        local cat = cfg.Categories[kind]
+        if not cat or not cat.enabled then return end
+        local ok, pivot = pcall(function() return model:GetPivot().Position end)
+        if not ok then return end
+        if math.abs(pivot.X) > 1e6 or math.abs(pivot.Z) > 1e6 then return end
+        local dist = (pivot - camPos).Magnitude
+        if dist > cat.maxDistance then return end
+        candidates[#candidates + 1] = { model = model, kind = kind, label = label, dist = dist, color = cat.color }
+    end
+
+    if cfg.Categories.Players.enabled then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local char = plr.Character
+                if char and char.Parent then
+                    local hum = char:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health > 0 then
+                        push(char, "Players", playerLabel(plr))
+                    end
+                end
+            end
+        end
+    end
+
+    for _, group in ipairs(CATEGORY_FOLDERS) do
+        local cat = cfg.Categories[group.category]
+        if cat and cat.enabled then
+            for _, folderName in ipairs(group.folders) do
+                local folder = Workspace:FindFirstChild(folderName)
+                if folder then
+                    for _, model in ipairs(folder:GetChildren()) do
+                        if model:IsA("Model") then
+                            push(model, group.category, npcLabel(model))
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        local ad = a.dist * (a.kind == "Players" and cfg.PlayerBias or 1)
+        local bd = b.dist * (b.kind == "Players" and cfg.PlayerBias or 1)
+        if ad ~= bd then return ad < bd end
+        return a.label < b.label
+    end)
+end
+
+local function updateChams()
+    local cfg = Hub.Config.ESP
+    local cap = math.min(cfg.MaxHighlights, 31)
+    local keep = {}
+    for i = 1, math.min(cap, #candidates) do
+        local c = candidates[i]
+        local parts = partsOf(c.model, labelFor(c.model))
+        if #parts > 0 then
+            keep[c.model] = true
+            applyCham(c.model, c.color)
+        end
+    end
+    for model in pairs(assigned) do
+        if not keep[model] then releaseCham(model) end
+    end
+    local count = 0
+    for _ in pairs(assigned) do count = count + 1 end
+    Hub.Stats.chams = count
+end
+
+local function hideAllESP()
+    releaseAllChams()
+    for _, e in pairs(labels) do hideLabel(e) end
+    Hub.Stats.chams = 0
+    Hub.Stats.targets = 0
+end
+
+--=============================================================
+-- Kill Aura
+--=============================================================
+
+local function biteCooldownFor(char)
+    local fallback = 0.7
+    if not Species or not char then return fallback end
+    local species = char:GetAttribute("Species") or "Wolf"
+    local growth = char:GetAttribute("Growth") or 1
+    local ok, cd = pcall(Species.biteCooldown, species, growth)
+    if ok and type(cd) == "number" then return cd end
+    return fallback
+end
+
+local function tryBite(targetModel)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local trp = targetModel and targetModel:FindFirstChild("HumanoidRootPart")
+    local thum = targetModel and targetModel:FindFirstChildOfClass("Humanoid")
+    if not (char and hrp and hum and hum.Health > 0 and trp and thum and thum.Health > 0) then return false end
+    if not WolfActions then return false end
+    if targetModel:GetAttribute("FeralDead") then return false end
+
+    -- face target on the horizontal plane
+    local from, to = hrp.Position, trp.Position
+    local flat = Vector3.new(to.X - from.X, 0, to.Z - from.Z)
+    if flat.Magnitude > 0.01 then
+        hrp.CFrame = CFrame.lookAt(from, from + flat.Unit)
+    end
+
+    local t = Workspace:GetServerTimeNow()
+    char:SetAttribute("WolfBiteAt", t)
+    WolfActions:FireServer("Bite", t)
+    task.delay(0.27, function()
+        if targetModel and targetModel.Parent and not targetModel:GetAttribute("FeralDead") then
+            local h = targetModel:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 then
+                WolfActions:FireServer("BiteHit", { t = t, m = targetModel })
+            end
+        end
+    end)
+
+    Hub.Stats.auraHits = Hub.Stats.auraHits + 1
+    return true
+end
+
+local function auraStep()
+    local cfg = Hub.Config.Aura
+    if not cfg.Enabled then return end
+
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (char and hrp and hum and hum.Health > 0) then return end
+
+    local cd = biteCooldownFor(char)
+    if os.clock() - lastBite < cd then return end
+
+    local range = cfg.Range or 18
+    local myPack = LocalPlayer:GetAttribute("FeralPack")
+    local best, bestDist = nil, nil
+
+    local function consider(model)
+        if not model or not model.Parent then return end
+        local h = model:FindFirstChildOfClass("Humanoid")
+        local r = model:FindFirstChild("HumanoidRootPart")
+        if not h or h.Health <= 0 or not r then return end
+        if model:GetAttribute("FeralDead") then return end
+        local pack = model:GetAttribute("FeralPack")
+        if myPack ~= nil and pack ~= nil and pack == myPack then return end
+        local d = (r.Position - hrp.Position).Magnitude
+        if d <= range and (not bestDist or d < bestDist) then
+            best, bestDist = model, d
+        end
+    end
+
+    if cfg.TargetNPCs then
+        for _, folderName in ipairs({"FeralNPCs", "FeralMice", "FeralCrows", "FeralCritters"}) do
+            local folder = Workspace:FindFirstChild(folderName)
+            if folder then
+                for _, m in ipairs(folder:GetChildren()) do consider(m) end
+            end
+        end
+    end
+
+    if cfg.TargetPlayers then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                consider(plr.Character)
+            end
+        end
+    end
+
+    if best then
+        lastBite = os.clock()
+        tryBite(best)
+    end
+end
+
+--=============================================================
+-- GUI
+--=============================================================
+
+local gui
+local guiRefs = {}
+
+local function protect(ui)
+    local parent = nil
+    pcall(function()
+        if gethui then parent = gethui() end
+    end)
+    if not parent then
+        local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+        if ok then parent = cg end
+    end
+    if not parent then parent = LocalPlayer:WaitForChild("PlayerGui") end
+    ui.Parent = parent
+    pcall(function()
+        if syn and syn.protect_gui then syn.protect_gui(ui) end
+    end)
+end
+
+local function make(class, props, children)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do inst[k] = v end
+    for _, c in ipairs(children or {}) do c.Parent = inst end
+    return inst
+end
+
+local function styleToggle(button, on)
+    if on then
+        button.BackgroundColor3 = Color3.fromRGB(255, 150, 40)
+        button.Text = "ON"
+        button.TextColor3 = Color3.fromRGB(20, 20, 22)
+    else
+        button.BackgroundColor3 = Color3.fromRGB(55, 55, 60)
+        button.Text = "OFF"
+        button.TextColor3 = Color3.fromRGB(200, 200, 205)
+    end
+end
+
+local function buildGui()
+    if gui then gui:Destroy() gui = nil end
+
+    local accent = Color3.fromRGB(255, 150, 40)
+    local panel = Color3.fromRGB(24, 24, 28)
+    local row = Color3.fromRGB(34, 34, 39)
+    local text = Color3.fromRGB(240, 240, 245)
+    local dim = Color3.fromRGB(150, 150, 158)
+
+    gui = Instance.new("ScreenGui")
+    gui.Name = "FeralHubGui"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local frame = make("Frame", {
+        Name = "Main",
+        Size = UDim2.fromOffset(320, 360),
+        Position = UDim2.new(0, 24, 0.5, -180),
+        BackgroundColor3 = panel,
+        BorderSizePixel = 0,
+        Active = true,
+        Draggable = true,
+    }, {
+        make("UICorner", { CornerRadius = UDim.new(0, 10) }),
+        make("UIStroke", { Color = Color3.fromRGB(55,55,62), Thickness = 1 }),
+    })
+    frame.Parent = gui
+
+    local title = make("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 40),
+        Position = UDim2.fromOffset(12, 6),
+        BackgroundTransparency = 1,
+        Text = "FERAL HUB",
+        Font = Enum.Font.GothamBold,
+        TextSize = 18,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = accent,
+    })
+    title.Parent = frame
+
+    local hint = make("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 16),
+        Position = UDim2.fromOffset(12, 38),
+        BackgroundTransparency = 1,
+        Text = "Right Ctrl to toggle menu",
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = dim,
+    })
+    hint.Parent = frame
+
+    local list = make("Frame", {
+        Size = UDim2.new(1, -24, 1, -70),
+        Position = UDim2.fromOffset(12, 58),
+        BackgroundTransparency = 1,
+    })
+    list.Parent = frame
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 8)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = list
+
+    local function addToggle(order, labelText, getFn, setFn)
+        local r = make("Frame", {
+            Size = UDim2.new(1, 0, 0, 44),
+            BackgroundColor3 = row,
+            BorderSizePixel = 0,
+            LayoutOrder = order,
+        }, { make("UICorner", { CornerRadius = UDim.new(0, 8) }) })
+
+        make("TextLabel", {
+            Size = UDim2.new(1, -90, 1, 0),
+            Position = UDim2.fromOffset(12, 0),
+            BackgroundTransparency = 1,
+            Text = labelText,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 14,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextColor3 = text,
+        }).Parent = r
+
+        local btn = make("TextButton", {
+            Size = UDim2.fromOffset(64, 28),
+            Position = UDim2.new(1, -76, 0.5, -14),
+            BorderSizePixel = 0,
+            Font = Enum.Font.GothamBold,
+            TextSize = 13,
+            AutoButtonColor = false,
+        }, { make("UICorner", { CornerRadius = UDim.new(0, 6) }) })
+        btn.Parent = r
+
+        local function refresh() styleToggle(btn, getFn()) end
+        btn.MouseButton1Click:Connect(function()
+            setFn(not getFn())
+            refresh()
+        end)
+        refresh()
+
+        r.Parent = list
+        return { refresh = refresh }
+    end
+
+    local function addSlider(order, labelText, minV, maxV, step, getFn, setFn)
+        local r = make("Frame", {
+            Size = UDim2.new(1, 0, 0, 56),
+            BackgroundColor3 = row,
+            BorderSizePixel = 0,
+            LayoutOrder = order,
+        }, { make("UICorner", { CornerRadius = UDim.new(0, 8) }) })
+
+        local lbl = make("TextLabel", {
+            Size = UDim2.new(1, -24, 0, 22),
+            Position = UDim2.fromOffset(12, 6),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 14,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextColor3 = text,
+        })
+        lbl.Parent = r
+
+        local minus = make("TextButton", {
+            Size = UDim2.fromOffset(28, 22),
+            Position = UDim2.fromOffset(12, 28),
+            BackgroundColor3 = Color3.fromRGB(55,55,60),
+            BorderSizePixel = 0,
+            Text = "-",
+            Font = Enum.Font.GothamBold,
+            TextSize = 16,
+            TextColor3 = text,
+            AutoButtonColor = false,
+        }, { make("UICorner", { CornerRadius = UDim.new(0, 5) }) })
+        minus.Parent = r
+
+        local plus = make("TextButton", {
+            Size = UDim2.fromOffset(28, 22),
+            Position = UDim2.fromOffset(46, 28),
+            BackgroundColor3 = Color3.fromRGB(55,55,60),
+            BorderSizePixel = 0,
+            Text = "+",
+            Font = Enum.Font.GothamBold,
+            TextSize = 16,
+            TextColor3 = text,
+            AutoButtonColor = false,
+        }, { make("UICorner", { CornerRadius = UDim.new(0, 5) }) })
+        plus.Parent = r
+
+        local function refresh()
+            lbl.Text = labelText .. ": " .. tostring(getFn())
+        end
+        minus.MouseButton1Click:Connect(function()
+            setFn(math.max(minV, getFn() - step))
+            refresh()
+        end)
+        plus.MouseButton1Click:Connect(function()
+            setFn(math.min(maxV, getFn() + step))
+            refresh()
+        end)
+        refresh()
+
+        r.Parent = list
+        return { refresh = refresh }
+    end
+
+    guiRefs.esp = addToggle(1, "ESP / Chams", function() return Hub.Config.ESP.Enabled end, function(v) Hub.Config.ESP.Enabled = v if not v then hideAllESP() end end)
+    guiRefs.aura = addToggle(2, "Kill Aura", function() return Hub.Config.Aura.Enabled end, function(v) Hub.Config.Aura.Enabled = v end)
+    guiRefs.npcs = addToggle(3, "Aura: NPCs", function() return Hub.Config.Aura.TargetNPCs end, function(v) Hub.Config.Aura.TargetNPCs = v end)
+    guiRefs.players = addToggle(4, "Aura: Players", function() return Hub.Config.Aura.TargetPlayers end, function(v) Hub.Config.Aura.TargetPlayers = v end)
+    guiRefs.range = addSlider(5, "Aura Range", 6, 40, 2, function() return Hub.Config.Aura.Range end, function(v) Hub.Config.Aura.Range = v end)
+
+    local note = make("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundTransparency = 1,
+        Text = "Players = orange  ·  NPCs = red\nChams limited to ~31 nearest",
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextColor3 = dim,
+        TextWrapped = true,
+        LayoutOrder = 6,
+    })
+    note.Parent = list
+
+    protect(gui)
+end
+
+--=============================================================
+-- Main loop / lifecycle
+--=============================================================
+
+local function step(now)
+    local camera = Workspace.CurrentCamera
+    if not camera then return end
+
+    if Hub.Config.ESP.Enabled then
+        if now - candidatesAt > 0.4 then
+            collectCandidates(now)
+            updateChams()
+            pruneLabels()
+            Hub.Stats.targets = #candidates
+        end
+        for _, c in ipairs(candidates) do
+            drawLabel(c, now, camera)
+        end
+    else
+        if Hub.Stats.chams ~= 0 or Hub.Stats.targets ~= 0 then hideAllESP() end
+    end
+end
+
+function Hub:Destroy()
+    running = false
+    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    connections = {}
+    hideAllESP()
+    for model, e in pairs(labels) do
+        if e.nameText then e.nameText:Remove() end
+        if e.distText then e.distText:Remove() end
+        labels[model] = nil
+    end
+    for _, h in ipairs(chamPool) do pcall(function() h:Destroy() end) end
+    chamPool = {}
+    if gui then gui:Destroy() gui = nil end
+end
+
+if running then Hub:Destroy() end
+pcall(function() if _G.FeralHub and _G.FeralHub.Destroy then _G.FeralHub:Destroy() end end)
+pcall(function() if _G.FeralESP and _G.FeralESP.Destroy then _G.FeralESP:Destroy() end end)
+
+running = true
+buildGui()
+
+local accumulator = 0
+connections[#connections + 1] = RunService.RenderStepped:Connect(function(dt)
+    accumulator = accumulator + dt
+    if accumulator < 1 / 60 then return end
+    accumulator = 0
+    local ok, err = pcall(step, os.clock())
+    if not ok then warn("[FeralHub] " .. tostring(err)) end
+end)
+
+connections[#connections + 1] = RunService.Heartbeat:Connect(function(dt)
+    auraAccum = auraAccum + dt
+    if auraAccum < 0.05 then return end
+    auraAccum = 0
+    local ok, err = pcall(auraStep)
+    if not ok then warn("[FeralHub] aura " .. tostring(err)) end
+end)
+
+connections[#connections + 1] = UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.RightControl then
+        if gui then gui.Enabled = not gui.Enabled end
+    end
+end)
+
+_G.FeralHub = Hub
+_G.FeralESP = Hub -- compat
+
+print("[FeralHub] loaded | menu: RightCtrl | ESP on, Kill Aura off")
+
+return Hub
