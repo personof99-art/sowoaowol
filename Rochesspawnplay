@@ -1,0 +1,626 @@
+--[[
+    PawnPal  ♟
+    Cute chess assistant for RoChess.
+    - HINTS mode: draws an arrow + shows the best move
+    - AUTO  mode: clicks the board to play the best move (no remotes)
+    Uses the game's own engine (ReplicatedStorage.Chess.Bot) at full strength.
+    RightShift = show / hide
+--]]
+
+--=============================================================
+-- config
+--=============================================================
+local CONFIG = {
+    thinkTime  = 1.8,                        -- seconds per search (higher = stronger, but freezes the client while thinking)
+    maxDepth   = 30,                         -- depth cap (time is the real limit)
+    autoDelay  = 0.35,                       -- pause before auto-playing so it looks natural
+    clickDelay = 0.09,                       -- gap between the two clicks on the board
+    hintColor  = Color3.fromRGB(124, 224, 180),
+    hideKey    = Enum.KeyCode.RightShift,
+    kinds      = { bot = true, online = true },
+}
+
+local PROMO = { q = 5, r = 4, b = 3, n = 2 }
+
+--=============================================================
+-- services / modules
+--=============================================================
+local Players   = game:GetService("Players")
+local RS        = game:GetService("ReplicatedStorage")
+local RunService= game:GetService("RunService")
+local TweenSvc  = game:GetService("TweenService")
+local UIS       = game:GetService("UserInputService")
+local VIM       = game:GetService("VirtualInputManager")
+local player    = Players.LocalPlayer
+
+local Chess     = RS:WaitForChild("Chess")
+local ChessClient = RS:WaitForChild("ChessClient")
+local App       = require(ChessClient.App)
+local Engine    = require(Chess.Engine)
+local Bot       = require(Chess.Bot)
+
+-- remove the temporary Session.new hook from earlier probing, if present
+if _G.__chessHook then
+    pcall(function()
+        local Session = require(ChessClient.Session)
+        for _, v in pairs(getupvalues(Session.new)) do
+            if type(v) == "function" then Session.new = v; break end
+        end
+    end)
+    _G.__chessHook = nil
+end
+
+-- clean up a previous run
+if _G.__pawnpal then pcall(_G.__pawnpal.destroy) end
+
+--=============================================================
+-- palette
+--=============================================================
+local BG         = Color3.fromRGB(30, 26, 28)
+local INK        = Color3.fromRGB(242, 234, 228)
+local MUTED      = Color3.fromRGB(166, 155, 149)
+local STROKE     = Color3.fromRGB(58, 52, 54)
+local SUNK       = Color3.fromRGB(43, 38, 40)
+local MINT       = Color3.fromRGB(94, 217, 166)
+local MINT_DEEP  = Color3.fromRGB(94, 217, 166)
+local PINK       = Color3.fromRGB(255, 158, 192)
+local PINK_DEEP  = Color3.fromRGB(255, 158, 192)
+local RED        = Color3.fromRGB(255, 130, 140)
+local ON_PILL    = Color3.fromRGB(26, 30, 28)
+local FONT       = Enum.Font.Gotham
+local FONT_BOLD  = Enum.Font.GothamBold
+
+--=============================================================
+-- helpers
+--=============================================================
+local function make(class, props, children)
+    local inst = Instance.new(class)
+    for k, v in pairs(props or {}) do inst[k] = v end
+    for _, c in ipairs(children or {}) do c.Parent = inst end
+    return inst
+end
+
+local function round(inst, px)
+    make("UICorner", { CornerRadius = UDim.new(0, px) }).Parent = inst
+    return inst
+end
+
+local function stroke(inst, color, px, transparency)
+    make("UIStroke", {
+        Color = color or STROKE,
+        Thickness = px or 1,
+        Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }).Parent = inst
+    return inst
+end
+
+local function fmtEval(res)
+    if not res then return "" end
+    if res.mate then
+        local n = math.abs(res.mate)
+        return (res.mate > 0 and "M" or "-M") .. tostring(n)
+    end
+    local s = (res.score or 0) / 100
+    return string.format("%+.2f", s)
+end
+
+local function moveSan(session, uci)
+    local ok, san = pcall(function()
+        local fen, ucis = session:searchArgs()
+        local e = Engine.new(fen or Engine.START_FEN)
+        for _, u in ipairs(ucis) do e:playUci(u) end
+        local m = e:moveFromUci(uci)
+        return m and e:moveToSan(m) or uci
+    end)
+    return ok and san or uci
+end
+
+local function analyse(session)
+    local fen, ucis = session:searchArgs()
+    local ok, res = pcall(Bot.analyse, fen, table.clone(ucis), CONFIG.thinkTime, CONFIG.maxDepth)
+    if ok and type(res) == "table" then return res end
+    return nil
+end
+
+local function stillValid(session, ply)
+    return session ~= nil
+        and App.session == session
+        and not session.over
+        and session:isMyTurn()
+        and session.viewPly == #session.ucis
+        and #session.ucis == ply
+end
+
+local function clearArrow()
+    pcall(function()
+        if App.board and App.board.setArrow then App.board:setArrow("hint", nil) end
+    end)
+end
+
+local function showArrow(uci)
+    pcall(function()
+        local from = Engine.algToIndex64(uci:sub(1, 2))
+        local to = Engine.algToIndex64(uci:sub(3, 4))
+        if App.board and App.board.setArrow then
+            App.board:setArrow("hint", from, to, CONFIG.hintColor, 0.16)
+        end
+    end)
+end
+
+-- real mouse clicks on the board (no remotes) -----------------
+local function screenCenter(gui)
+    local p = gui.AbsolutePosition + gui.AbsoluteSize * 0.5
+    return p.X, p.Y
+end
+
+local function clickAt(x, y)
+    x, y = math.floor(x), math.floor(y)
+    local ok = pcall(function()
+        VIM:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.03)
+        VIM:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    if not ok then
+        mousemoveabs(x, y)
+        task.wait(0.02)
+        mouse1click()
+    end
+end
+
+local function clickSquare(index)
+    local bv = App.board
+    local sq = bv and bv.squares and bv.squares[index]
+    if not sq or not sq.Visible then return false end
+    local x, y = screenCenter(sq)
+    clickAt(x, y)
+    return true
+end
+
+local function clickMove(uci)
+    local bv = App.board
+    if not bv then return false end
+
+    local session = App.session
+    local before = session and #session.ucis or 0
+    local from = Engine.algToIndex64(uci:sub(1, 2))
+    local to   = Engine.algToIndex64(uci:sub(3, 4))
+    local promoNum = PROMO[uci:sub(5, 5)]
+
+    local function attempt()
+        if not clickSquare(from) then return end
+        task.wait(CONFIG.clickDelay)
+        clickSquare(to)
+    end
+
+    attempt()
+    task.wait(0.35)
+
+    if promoNum then
+        local choice
+        for _ = 1, 20 do
+            choice = bv.overlayLayer and bv.overlayLayer:FindFirstChild("Choice" .. promoNum, true)
+            if choice then break end
+            task.wait(0.05)
+        end
+        if choice then
+            local x, y = screenCenter(choice)
+            clickAt(x, y)
+        end
+    elseif session and #session.ucis == before then
+        attempt() -- click didn't register, try once more
+    end
+    return true
+end
+
+--=============================================================
+-- gui
+--=============================================================
+local gui = make("ScreenGui", {
+    Name = "PawnPal",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local shadow = round(make("Frame", {
+    Size = UDim2.fromOffset(238, 0),
+    Position = UDim2.new(0, 23, 0, 123),
+    BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+    BackgroundTransparency = 0.55,
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BorderSizePixel = 0,
+}), 19)
+shadow.Parent = gui
+
+local card = round(make("Frame", {
+    Size = UDim2.fromOffset(238, 0),
+    Position = UDim2.new(0, 20, 0, 120),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundColor3 = BG,
+    BorderSizePixel = 0,
+}), 19)
+stroke(card)
+card.Parent = gui
+
+make("UIGradient", {
+    Rotation = 90,
+    Color = ColorSequence.new(Color3.fromRGB(39, 34, 36), Color3.fromRGB(27, 23, 25)),
+}).Parent = card
+
+local pad = make("UIPadding", {
+    PaddingTop = UDim.new(0, 12),
+    PaddingBottom = UDim.new(0, 12),
+    PaddingLeft = UDim.new(0, 14),
+    PaddingRight = UDim.new(0, 14),
+})
+pad.Parent = card
+
+local list = make("UIListLayout", {
+    FillDirection = Enum.FillDirection.Vertical,
+    SortOrder = Enum.SortOrder.LayoutOrder,
+    Padding = UDim.new(0, 10),
+})
+list.Parent = card
+
+-- header ------------------------------------------------------
+local header = make("Frame", {
+    Size = UDim2.new(1, 0, 0, 20),
+    BackgroundTransparency = 1,
+    LayoutOrder = 1,
+})
+header.Parent = card
+
+make("TextLabel", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, -22, 1, 0),
+    Font = FONT_BOLD,
+    TextSize = 14,
+    TextColor3 = INK,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = "♟ pawnpal",
+    Parent = header,
+})
+
+local collapseBtn = make("TextButton", {
+    Size = UDim2.fromOffset(20, 20),
+    Position = UDim2.new(1, -20, 0, 0),
+    BackgroundTransparency = 1,
+    Font = FONT_BOLD,
+    TextSize = 14,
+    TextColor3 = MUTED,
+    Text = "–",
+    AutoButtonColor = false,
+    Parent = header,
+})
+
+local body = make("Frame", {
+    Size = UDim2.new(1, 0, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    LayoutOrder = 2,
+})
+body.Parent = card
+
+local bodyList = make("UIListLayout", {
+    FillDirection = Enum.FillDirection.Vertical,
+    SortOrder = Enum.SortOrder.LayoutOrder,
+    Padding = UDim.new(0, 8),
+})
+bodyList.Parent = body
+
+-- mode switch -------------------------------------------------
+local switch = round(make("Frame", {
+    Size = UDim2.new(1, 0, 0, 32),
+    BackgroundColor3 = SUNK,
+    BorderSizePixel = 0,
+    LayoutOrder = 1,
+    Parent = body,
+}), 16)
+stroke(switch, STROKE)
+
+local switchPad = make("UIPadding", {
+    PaddingTop = UDim.new(0, 3),
+    PaddingBottom = UDim.new(0, 3),
+    PaddingLeft = UDim.new(0, 3),
+    PaddingRight = UDim.new(0, 3),
+})
+switchPad.Parent = switch
+
+local function modeButton(text, order)
+    local b = make("TextButton", {
+        Size = UDim2.new(0.5, -2, 1, 0),
+        Position = UDim2.new(order * 0.5, order == 0 and 0 or 2, 0, 0),
+        BackgroundTransparency = 1,
+        Font = FONT_BOLD,
+        TextSize = 12,
+        TextColor3 = MUTED,
+        Text = text,
+        AutoButtonColor = false,
+        LayoutOrder = order,
+        Parent = switch,
+    })
+    round(b, 13)
+    return b
+end
+
+local hintBtn = modeButton("hints", 0)
+local autoBtn = modeButton("auto", 1)
+
+local modePill = round(make("Frame", {
+    Size = UDim2.new(0.5, -2, 1, 0),
+    Position = UDim2.fromOffset(0, 0),
+    BackgroundColor3 = MINT,
+    BorderSizePixel = 0,
+    ZIndex = 0,
+    Parent = switch,
+}), 13)
+hintBtn.ZIndex = 2
+autoBtn.ZIndex = 2
+
+-- status ------------------------------------------------------
+local statusRow = make("Frame", {
+    Size = UDim2.new(1, 0, 0, 16),
+    BackgroundTransparency = 1,
+    LayoutOrder = 2,
+    Parent = body,
+})
+
+local dot = round(make("Frame", {
+    Size = UDim2.fromOffset(7, 7),
+    Position = UDim2.new(0, 1, 0.5, -3),
+    BackgroundColor3 = MUTED,
+    BorderSizePixel = 0,
+    Parent = statusRow,
+}), 4)
+
+local statusLabel = make("TextLabel", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, -16, 1, 0),
+    Position = UDim2.fromOffset(14, 0),
+    Font = FONT,
+    TextSize = 12,
+    TextColor3 = MUTED,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = "looking for a game…",
+    Parent = statusRow,
+})
+
+-- best move chip ----------------------------------------------
+local chip = round(make("Frame", {
+    Size = UDim2.new(1, 0, 0, 30),
+    BackgroundColor3 = SUNK,
+    BorderSizePixel = 0,
+    LayoutOrder = 3,
+    Parent = body,
+}), 12)
+stroke(chip, STROKE)
+
+local chipLabel = make("TextLabel", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, -16, 1, 0),
+    Position = UDim2.fromOffset(9, 0),
+    Font = FONT,
+    TextSize = 12,
+    TextColor3 = INK,
+    RichText = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = '<font color="#9e938d">best</font>  –',
+    Parent = chip,
+})
+
+-- footer ------------------------------------------------------
+local footer = make("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 12),
+    BackgroundTransparency = 1,
+    Font = FONT,
+    TextSize = 10,
+    TextColor3 = Color3.fromRGB(138, 128, 123),
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Text = "RightShift · drag the top",
+    LayoutOrder = 4,
+    Parent = body,
+})
+
+--=============================================================
+-- gui behaviour
+--=============================================================
+local mode = _G.__pawnpalMode or "hint" -- "hint" | "auto"
+_G.__pawnpalMode = mode
+
+local function refreshSwitch()
+    local active, inactive
+    if mode == "auto" then active, inactive = autoBtn, hintBtn else active, inactive = hintBtn, autoBtn end
+    TweenSvc:Create(modePill, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+        Position = active.Position,
+        BackgroundColor3 = mode == "auto" and PINK or MINT,
+    }):Play()
+    TweenSvc:Create(active, TweenInfo.new(0.18), { TextColor3 = ON_PILL }):Play()
+    TweenSvc:Create(inactive, TweenInfo.new(0.18), { TextColor3 = MUTED }):Play()
+end
+
+local function setMode(m)
+    mode = m == "auto" and "auto" or "hint"
+    _G.__pawnpalMode = mode
+    refreshSwitch()
+end
+
+hintBtn.MouseButton1Click:Connect(function() setMode("hint"); clearArrow() end)
+autoBtn.MouseButton1Click:Connect(function() setMode("auto") end)
+refreshSwitch()
+
+pcall(function() App.board:deselect() end)
+
+-- collapse
+local collapsed = false
+collapseBtn.MouseButton1Click:Connect(function()
+    collapsed = not collapsed
+    body.Visible = not collapsed
+    collapseBtn.Text = collapsed and "+" or "–"
+end)
+
+-- drag
+local dragging, dragStart, startPos
+header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragStart, startPos = true, input.Position, card.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+UIS.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local d = input.Position - dragStart
+    card.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    shadow.Position = UDim2.new(card.Position.X.Scale, card.Position.X.Offset + 3, card.Position.Y.Scale, card.Position.Y.Offset + 3)
+end)
+
+local visible = true
+UIS.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == CONFIG.hideKey then
+        visible = not visible
+        gui.Enabled = visible
+    end
+end)
+
+--=============================================================
+-- status / arrow
+--=============================================================
+local pulseConn
+local function setThinking(on)
+    if pulseConn then pulseConn:Disconnect(); pulseConn = nil end
+    dot.BackgroundTransparency = 0
+    if on then
+        local t = 0
+        pulseConn = RunService.RenderStepped:Connect(function(dt)
+            t = t + dt
+            dot.BackgroundTransparency = 0.3 + 0.3 * math.sin(t * 6)
+        end)
+    end
+end
+
+local function setStatus(text, color)
+    statusLabel.Text = text
+    dot.BackgroundColor3 = color or MUTED
+end
+
+local function showChip(san, ev)
+    chipLabel.Text = string.format('<font color="#9e938d">best</font>  <b>%s</b>  <font color="#5ed9a6">%s</font>', san, ev)
+end
+
+--=============================================================
+-- main loop
+--=============================================================
+local running = true
+local thinkToken = 0
+local lastKey = nil
+local lastAutoPly = nil
+
+local function scheduleThink(session, key)
+    local ply = #session.ucis
+    thinkToken = thinkToken + 1
+    local token = thinkToken
+    setThinking(true)
+    setStatus(mode == "auto" and "thinking…" or "finding a move…", mode == "auto" and PINK_DEEP or MINT_DEEP)
+    chipLabel.Text = '<font color="#9e938d">best</font>  …'
+
+    task.spawn(function()
+        local res = analyse(session)
+
+        if token ~= thinkToken or not running then return end
+        if not res or not res.best then
+            setThinking(false)
+            setStatus("no move found", RED)
+            return
+        end
+
+        local san = moveSan(session, res.best)
+        local ev = fmtEval(res)
+
+        if not stillValid(session, ply) then
+            -- position moved on while we were thinking
+            setThinking(false)
+            return
+        end
+
+        setThinking(false)
+        showChip(san, ev)
+        showArrow(res.best)
+        setStatus("your move", MINT_DEEP)
+
+        if mode == "auto" and lastAutoPly ~= ply then
+            task.wait(CONFIG.autoDelay)
+            if token ~= thinkToken or not running then return end
+            if stillValid(session, ply) and lastAutoPly ~= ply then
+                lastAutoPly = ply
+                clickMove(res.best)
+            end
+        end
+    end)
+end
+
+local function loop()
+    while running do
+        local session = App.session
+
+        if session and CONFIG.kinds[session.kind] then
+            if session.over then
+                clearArrow()
+                setThinking(false)
+                local st = session:status()
+                setStatus(st == "checkmate" and "checkmate — gg" or "game over", MUTED)
+                chipLabel.Text = '<font color="#9e938d">best</font>  –'
+                lastKey = nil
+                lastAutoPly = nil
+            elseif session.viewPly ~= #session.ucis then
+                clearArrow()
+                setThinking(false)
+                setStatus("reviewing…", MUTED)
+                lastKey = nil
+            elseif session:isMyTurn() then
+                local key = session.kind .. ":" .. tostring(session.id) .. ":" .. #session.ucis
+                if key ~= lastKey then
+                    lastKey = key
+                    scheduleThink(session, key)
+                end
+            else
+                clearArrow()
+                setThinking(false)
+                lastKey = nil
+                setStatus(session:status() == "check" and "you're in check" or "waiting for opponent", MUTED)
+                chipLabel.Text = '<font color="#9e938d">best</font>  –'
+            end
+        else
+            clearArrow()
+            setThinking(false)
+            setStatus("looking for a game…", MUTED)
+            lastKey = nil
+        end
+
+        task.wait(0.2)
+    end
+end
+
+task.spawn(loop)
+
+--=============================================================
+-- teardown handle
+--=============================================================
+_G.__pawnpal = {
+    destroy = function()
+        running = false
+        thinkToken = thinkToken + 1
+        if pulseConn then pulseConn:Disconnect() end
+        clearArrow()
+        gui:Destroy()
+        _G.__pawnpal = nil
+    end,
+    setMode = setMode,
+    getMode = function() return mode end,
+}
+
+print("[pawnpal] loaded ♟")
