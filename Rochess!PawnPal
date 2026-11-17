@@ -3,6 +3,7 @@
     Cute chess assistant for RoChess.
     - HINTS mode: draws an arrow + shows the best move
     - AUTO  mode: clicks the board to play the best move (no remotes)
+    - NORMAL / ⚡ BULLET speed: bullet searches briefly and moves instantly
     Uses the game's own engine (ReplicatedStorage.Chess.Bot) at full strength.
     RightShift = show / hide
 --]]
@@ -10,17 +11,46 @@
 --=============================================================
 -- config
 --=============================================================
+-- speed presets. bullet moves as fast as the board allows.
+local SPEED = {
+    normal = {
+        thinkTime  = 1.8,   -- seconds per search (higher = stronger, but freezes the client while thinking)
+        maxDepth   = 30,    -- depth cap (time is the real limit)
+        replyTime  = 0.6,   -- search for the opponent's likely reply (red arrow)
+        replyDepth = 12,
+        autoDelay  = 0.35,  -- pause before auto-playing so it looks natural
+        clickDelay = 0.09,  -- gap between the two clicks on the board
+        poll       = 0.20,  -- main loop tick
+        confirm    = 0.80,  -- how long to wait for a click to register
+    },
+    bullet = {
+        thinkTime  = 0.22,  -- short search; the client only freezes for a blink
+        maxDepth   = 8,
+        replyTime  = 0.08,
+        replyDepth = 6,
+        autoDelay  = 0.0,
+        clickDelay = 0.02,
+        poll       = 0.04,
+        confirm    = 0.35,
+    },
+}
+
 local CONFIG = {
-    thinkTime  = 1.8,                        -- seconds per search (higher = stronger, but freezes the client while thinking)
-    maxDepth   = 30,                         -- depth cap (time is the real limit)
-    autoDelay  = 0.35,                       -- pause before auto-playing so it looks natural
-    clickDelay = 0.09,                       -- gap between the two clicks on the board
-    hintColor  = Color3.fromRGB(124, 224, 180),
-    hideKey    = Enum.KeyCode.RightShift,
-    kinds      = { bot = true, online = true },
+    hintColor = Color3.fromRGB(124, 224, 180),
+    replyColor = Color3.fromRGB(255, 92, 106), -- transparent red for the think-ahead arrow
+    replyAlpha = 0.5,
+    hideKey   = Enum.KeyCode.RightShift,
+    kinds     = { bot = true, online = true },
 }
 
 local PROMO = { q = 5, r = 4, b = 3, n = 2 }
+
+local bullet = _G.__pawnpalBullet == true
+local plan = _G.__pawnpalPlan ~= false -- "think ahead" arrow, on by default
+
+-- which side PawnPal plays as. nil = follow the game's own detection.
+local sideChoice = nil   -- "white" | "black" | nil
+local sideSession = nil  -- the game the manual choice belongs to
 
 --=============================================================
 -- services / modules
@@ -30,7 +60,6 @@ local RS        = game:GetService("ReplicatedStorage")
 local RunService= game:GetService("RunService")
 local TweenSvc  = game:GetService("TweenService")
 local UIS       = game:GetService("UserInputService")
-local VIM       = game:GetService("VirtualInputManager")
 local player    = Players.LocalPlayer
 
 local Chess     = RS:WaitForChild("Chess")
@@ -54,19 +83,40 @@ end
 if _G.__pawnpal then pcall(_G.__pawnpal.destroy) end
 
 --=============================================================
+-- side detection (white = 1, black = -1)
+--=============================================================
+local function ourColor(session)
+    session = session or App.session
+    if sideChoice and (sideSession == nil or sideSession == session) then
+        return sideChoice == "white" and 1 or -1
+    end
+    return (session and session.myColor) or 1
+end
+
+local function isOurTurn(session)
+    if not session or session.over then return false end
+    local moving = session:sideToMove()
+    return moving ~= nil and moving == ourColor(session)
+end
+
+--=============================================================
 -- palette
 --=============================================================
-local BG         = Color3.fromRGB(30, 26, 28)
-local INK        = Color3.fromRGB(242, 234, 228)
-local MUTED      = Color3.fromRGB(166, 155, 149)
-local STROKE     = Color3.fromRGB(58, 52, 54)
-local SUNK       = Color3.fromRGB(43, 38, 40)
-local MINT       = Color3.fromRGB(94, 217, 166)
-local MINT_DEEP  = Color3.fromRGB(94, 217, 166)
-local PINK       = Color3.fromRGB(255, 158, 192)
-local PINK_DEEP  = Color3.fromRGB(255, 158, 192)
+-- kawaii sakura palette 🌸
+local BG         = Color3.fromRGB(255, 236, 245) -- soft blush card
+local INK        = Color3.fromRGB(104, 52, 76)   -- deep rose text
+local MUTED      = Color3.fromRGB(176, 126, 150)
+local STROKE     = Color3.fromRGB(244, 190, 214)
+local SUNK       = Color3.fromRGB(255, 218, 234) -- inset rows
+local MINT       = Color3.fromRGB(255, 138, 186) -- default pill
+local MINT_DEEP  = Color3.fromRGB(232, 92, 152)  -- status pink
+local PINK       = Color3.fromRGB(255, 105, 175) -- auto pill
+local PINK_DEEP  = Color3.fromRGB(233, 74, 150)
 local RED        = Color3.fromRGB(255, 130, 140)
-local ON_PILL    = Color3.fromRGB(26, 30, 28)
+local AMBER      = Color3.fromRGB(255, 165, 205) -- bullet pill
+local WHITE_PILL  = Color3.fromRGB(255, 250, 253)
+local BLACK_PILL  = Color3.fromRGB(150, 95, 125)
+local ON_PILL    = Color3.fromRGB(255, 255, 255) -- text on coloured pills
 local FONT       = Enum.Font.Gotham
 local FONT_BOLD  = Enum.Font.GothamBold
 
@@ -116,9 +166,34 @@ local function moveSan(session, uci)
     return ok and san or uci
 end
 
-local function analyse(session)
-    local fen, ucis = session:searchArgs()
-    local ok, res = pcall(Bot.analyse, fen, table.clone(ucis), CONFIG.thinkTime, CONFIG.maxDepth)
+local function timing()
+    local p = bullet and SPEED.bullet or SPEED.normal
+    if not bullet then return p end
+
+    -- burn a slice of the real clock when the game exposes one,
+    -- so a 30s bullet game gets faster replies than a 2min one
+    local t = p.thinkTime
+    local session = App.session
+    if session and session.clocks and type(session.clockFor) == "function" then
+        local ok, ms = pcall(session.clockFor, session, ourColor(session))
+        if ok and type(ms) == "number" and ms > 0 then
+            t = math.clamp(ms / 25000, 0.06, p.thinkTime)
+        end
+    end
+    return {
+        thinkTime  = t,
+        maxDepth   = p.maxDepth,
+        replyTime  = math.max(0.04, t * (p.replyTime / p.thinkTime)),
+        replyDepth = p.replyDepth,
+        autoDelay  = p.autoDelay,
+        clickDelay = p.clickDelay,
+        poll       = p.poll,
+        confirm    = p.confirm,
+    }
+end
+
+local function analyse(fen, ucis, t)
+    local ok, res = pcall(Bot.analyse, fen, table.clone(ucis), t.thinkTime, t.maxDepth)
     if ok and type(res) == "table" then return res end
     return nil
 end
@@ -127,14 +202,23 @@ local function stillValid(session, ply)
     return session ~= nil
         and App.session == session
         and not session.over
-        and session:isMyTurn()
+        and isOurTurn(session)
         and session.viewPly == #session.ucis
         and #session.ucis == ply
 end
 
-local function clearArrow()
+local function clearHint()
     pcall(function()
         if App.board and App.board.setArrow then App.board:setArrow("hint", nil) end
+    end)
+end
+
+local function clearArrow()
+    pcall(function()
+        if App.board and App.board.setArrow then
+            App.board:setArrow("hint", nil)
+            App.board:setArrow("plan", nil)
+        end
     end)
 end
 
@@ -148,7 +232,39 @@ local function showArrow(uci)
     end)
 end
 
+-- think ahead for YOU: play the best move, assume their likely answer,
+-- then draw the follow-up you are planning (transparent red)
+local function planReply(fen, ucis, uci, t)
+    pcall(function()
+        local startFen = fen or Engine.START_FEN
+
+        local afterUs = table.clone(ucis)
+        table.insert(afterUs, uci)
+
+        local theirs = Bot.analyse(startFen, afterUs, t.replyTime, t.replyDepth)
+        if not theirs or not theirs.best then return end
+
+        local afterThem = table.clone(afterUs)
+        table.insert(afterThem, theirs.best)
+
+        local ours = Bot.analyse(startFen, afterThem, t.replyTime, t.replyDepth)
+        if not ours or not ours.best then return end
+
+        -- only while the board is still at (or one ply past) our move
+        local now = App.session and #App.session.ucis
+        if now ~= #ucis and now ~= #afterUs then return end
+
+        local from = Engine.algToIndex64(ours.best:sub(1, 2))
+        local to = Engine.algToIndex64(ours.best:sub(3, 4))
+        if App.board and App.board.setArrow then
+            App.board:setArrow("plan", from, to, CONFIG.replyColor, CONFIG.replyAlpha)
+        end
+    end)
+end
+
 -- real mouse clicks on the board (no remotes) -----------------
+local VIM = game:GetService("VirtualInputManager")
+
 local function screenCenter(gui)
     local p = gui.AbsolutePosition + gui.AbsoluteSize * 0.5
     return p.X, p.Y
@@ -177,41 +293,85 @@ local function clickSquare(index)
     return true
 end
 
-local function clickMove(uci)
+local function clickMove(uci, t)
     local bv = App.board
     if not bv then return false end
 
     local session = App.session
-    local before = session and #session.ucis or 0
+    if not session then return false end
+
+    -- a leftover manual selection would eat the first click
+    if bv.selected then pcall(function() bv:deselect() end) end
+
+    local startPly = #session.ucis
     local from = Engine.algToIndex64(uci:sub(1, 2))
     local to   = Engine.algToIndex64(uci:sub(3, 4))
     local promoNum = PROMO[uci:sub(5, 5)]
 
-    local function attempt()
-        if not clickSquare(from) then return end
-        task.wait(CONFIG.clickDelay)
-        clickSquare(to)
+    local function currentPly()
+        return App.session and #App.session.ucis or -1
     end
 
-    attempt()
-    task.wait(0.35)
+    local function waitForMove(seconds)
+        local deadline = os.clock() + seconds
+        repeat
+            if currentPly() ~= startPly then return true end
+            task.wait(0.01)
+        until os.clock() >= deadline
+        return false
+    end
+
+    -- click a square and wait until the board actually shows it selected
+    local function pickSquare(index)
+        for _ = 1, 3 do
+            if not clickSquare(index) then return false end
+            local deadline = os.clock() + 0.2
+            repeat
+                if bv.selected == index then return true end
+                task.wait(0.01)
+            until os.clock() >= deadline
+        end
+        return false
+    end
+
+    if not pickSquare(from) then
+        -- the piece never stuck; one blind attempt anyway
+        clickSquare(to)
+        return waitForMove(t.confirm)
+    end
+
+    -- destination click can bounce off a board that is still settling
+    for _ = 1, 3 do
+        clickSquare(to)
+        if waitForMove(promoNum and 0.2 or 0.18) then break end
+        if bv.selected ~= from then break end
+    end
 
     if promoNum then
         local choice
-        for _ = 1, 20 do
+        for _ = 1, 40 do
             choice = bv.overlayLayer and bv.overlayLayer:FindFirstChild("Choice" .. promoNum, true)
             if choice then break end
-            task.wait(0.05)
+            task.wait(0.02)
         end
         if choice then
             local x, y = screenCenter(choice)
             clickAt(x, y)
         end
-    elseif session and #session.ucis == before then
-        attempt() -- click didn't register, try once more
+        return waitForMove(t.confirm)
     end
-    return true
+
+    return currentPly() ~= startPly
 end
+
+--=============================================================
+-- shared run state
+--=============================================================
+local running = true
+local thinkToken = 0
+local lastKey = nil
+local lastAutoPly = nil
+local lastPlan = nil
 
 --=============================================================
 -- gui
@@ -227,8 +387,8 @@ gui.Parent = player:WaitForChild("PlayerGui")
 local shadow = round(make("Frame", {
     Size = UDim2.fromOffset(238, 0),
     Position = UDim2.new(0, 23, 0, 123),
-    BackgroundColor3 = Color3.fromRGB(0, 0, 0),
-    BackgroundTransparency = 0.55,
+    BackgroundColor3 = Color3.fromRGB(180, 120, 150),
+    BackgroundTransparency = 0.35,
     AutomaticSize = Enum.AutomaticSize.Y,
     BorderSizePixel = 0,
 }), 19)
@@ -240,14 +400,79 @@ local card = round(make("Frame", {
     AutomaticSize = Enum.AutomaticSize.Y,
     BackgroundColor3 = BG,
     BorderSizePixel = 0,
+    ZIndex = 2,
 }), 19)
 stroke(card)
 card.Parent = gui
 
 make("UIGradient", {
     Rotation = 90,
-    Color = ColorSequence.new(Color3.fromRGB(39, 34, 36), Color3.fromRGB(27, 23, 25)),
+    Color = ColorSequence.new(Color3.fromRGB(255, 242, 249), Color3.fromRGB(255, 224, 238)),
 }).Parent = card
+
+-- sakura petals falling INSIDE the menu card 🌸
+local petalLayer = make("Frame", {
+    Size = UDim2.fromOffset(238, 240),
+    Position = UDim2.new(0, 20, 0, 120),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    Active = false,
+    ZIndex = 3,
+})
+petalLayer.Parent = gui
+
+local PETAL_COLORS = {
+    Color3.fromRGB(255, 183, 209),
+    Color3.fromRGB(255, 205, 222),
+    Color3.fromRGB(255, 160, 195),
+}
+local petals = {}
+for i = 1, 14 do
+    local size = 7 + math.random(0, 6)
+    local p = round(make("Frame", {
+        Size = UDim2.fromOffset(size, math.floor(size * 0.62)),
+        Position = UDim2.new(math.random(), 0, 0, -20),
+        BackgroundColor3 = PETAL_COLORS[i % #PETAL_COLORS + 1],
+        BackgroundTransparency = 0.4 + math.random(0, 20) / 100,
+        BorderSizePixel = 0,
+        Rotation = math.random(0, 360),
+        ZIndex = 3,
+        Parent = petalLayer,
+    }), 20)
+    table.insert(petals, {
+        obj = p,
+        baseX = math.random(),
+        y = -20 - math.random(0, 240),
+        speed = 14 + math.random(0, 22),
+        sway = 0.6 + math.random() * 1.2,
+        swayAmt = 4 + math.random(0, 10),
+        phase = math.random() * math.pi * 2,
+        spin = (math.random() < 0.5 and -1 or 1) * (8 + math.random(0, 26)),
+    })
+end
+
+local petalConn
+local petalClock = 0
+local function animatePetals(dt)
+    petalClock = petalClock + dt
+    -- follow the card, including while it is dragged or collapsed
+    petalLayer.Position = UDim2.new(0, card.AbsolutePosition.X, 0, card.AbsolutePosition.Y)
+    petalLayer.Size = UDim2.fromOffset(card.AbsoluteSize.X, card.AbsoluteSize.Y)
+    local w, h = petalLayer.AbsoluteSize.X, petalLayer.AbsoluteSize.Y
+    if w <= 0 or h <= 0 then return end
+    for _, q in ipairs(petals) do
+        q.y = q.y + q.speed * dt
+        if q.y > h + 12 then
+            q.y = -12
+            q.baseX = math.random()
+        end
+        local x = math.clamp(q.baseX * w + math.sin(petalClock * q.sway + q.phase) * q.swayAmt, 0, w)
+        q.obj.Position = UDim2.new(0, math.floor(x), 0, math.floor(q.y))
+        q.obj.Rotation = q.obj.Rotation + q.spin * dt
+    end
+end
+petalConn = RunService.RenderStepped:Connect(animatePetals)
 
 local pad = make("UIPadding", {
     PaddingTop = UDim.new(0, 12),
@@ -279,7 +504,7 @@ make("TextLabel", {
     TextSize = 14,
     TextColor3 = INK,
     TextXAlignment = Enum.TextXAlignment.Left,
-    Text = "♟ pawnpal",
+    Text = "🌸 pawnpal ♟",
     Parent = header,
 })
 
@@ -359,11 +584,155 @@ local modePill = round(make("Frame", {
 hintBtn.ZIndex = 2
 autoBtn.ZIndex = 2
 
+-- speed switch ------------------------------------------------
+local speedRow = round(make("Frame", {
+    Size = UDim2.new(1, 0, 0, 24),
+    BackgroundColor3 = SUNK,
+    BorderSizePixel = 0,
+    LayoutOrder = 2,
+    Parent = body,
+}), 12)
+stroke(speedRow, STROKE)
+
+local speedPad = make("UIPadding", {
+    PaddingTop = UDim.new(0, 2),
+    PaddingBottom = UDim.new(0, 2),
+    PaddingLeft = UDim.new(0, 2),
+    PaddingRight = UDim.new(0, 2),
+})
+speedPad.Parent = speedRow
+
+local function speedButton(text, order)
+    local b = make("TextButton", {
+        Size = UDim2.new(0.5, -1, 1, 0),
+        Position = UDim2.new(order * 0.5, order == 0 and 0 or 1, 0, 0),
+        BackgroundTransparency = 1,
+        Font = FONT_BOLD,
+        TextSize = 10,
+        TextColor3 = MUTED,
+        Text = text,
+        AutoButtonColor = false,
+        Parent = speedRow,
+    })
+    round(b, 10)
+    return b
+end
+
+local normalBtn = speedButton("normal", 0)
+local bulletBtn = speedButton("⚡ bullet", 1)
+
+local speedPill = round(make("Frame", {
+    Size = UDim2.new(0.5, -1, 1, 0),
+    Position = UDim2.fromOffset(0, 0),
+    BackgroundColor3 = MINT,
+    BorderSizePixel = 0,
+    ZIndex = 0,
+    Parent = speedRow,
+}), 10)
+normalBtn.ZIndex = 2
+bulletBtn.ZIndex = 2
+
+-- think-ahead switch ------------------------------------------
+local planRow = round(make("Frame", {
+    Size = UDim2.new(1, 0, 0, 24),
+    BackgroundColor3 = SUNK,
+    BorderSizePixel = 0,
+    LayoutOrder = 3,
+    Parent = body,
+}), 12)
+stroke(planRow, STROKE)
+
+local planPad = make("UIPadding", {
+    PaddingTop = UDim.new(0, 2),
+    PaddingBottom = UDim.new(0, 2),
+    PaddingLeft = UDim.new(0, 2),
+    PaddingRight = UDim.new(0, 2),
+})
+planPad.Parent = planRow
+
+local function planButton(text, order)
+    local b = make("TextButton", {
+        Size = UDim2.new(0.5, -1, 1, 0),
+        Position = UDim2.new(order * 0.5, order == 0 and 0 or 1, 0, 0),
+        BackgroundTransparency = 1,
+        Font = FONT_BOLD,
+        TextSize = 10,
+        TextColor3 = MUTED,
+        Text = text,
+        AutoButtonColor = false,
+        Parent = planRow,
+    })
+    round(b, 10)
+    return b
+end
+
+local plainBtn = planButton("normal", 0)
+local aheadBtn = planButton("think ahead", 1)
+
+local planPill = round(make("Frame", {
+    Size = UDim2.new(0.5, -1, 1, 0),
+    Position = UDim2.fromOffset(0, 0),
+    BackgroundColor3 = MINT,
+    BorderSizePixel = 0,
+    ZIndex = 0,
+    Parent = planRow,
+}), 10)
+plainBtn.ZIndex = 2
+aheadBtn.ZIndex = 2
+
+-- side switch (which colour PawnPal plays) --------------------
+local sideRow = round(make("Frame", {
+    Size = UDim2.new(1, 0, 0, 24),
+    BackgroundColor3 = SUNK,
+    BorderSizePixel = 0,
+    LayoutOrder = 4,
+    Parent = body,
+}), 12)
+stroke(sideRow, STROKE)
+
+local sidePad = make("UIPadding", {
+    PaddingTop = UDim.new(0, 2),
+    PaddingBottom = UDim.new(0, 2),
+    PaddingLeft = UDim.new(0, 2),
+    PaddingRight = UDim.new(0, 2),
+})
+sidePad.Parent = sideRow
+
+local function sideButton(text, order)
+    local b = make("TextButton", {
+        Size = UDim2.new(0.5, -1, 1, 0),
+        Position = UDim2.new(order * 0.5, order == 0 and 0 or 1, 0, 0),
+        BackgroundTransparency = 1,
+        Font = FONT_BOLD,
+        TextSize = 10,
+        TextColor3 = MUTED,
+        Text = text,
+        AutoButtonColor = false,
+        Parent = sideRow,
+    })
+    round(b, 10)
+    return b
+end
+
+local whiteBtn = sideButton("white", 0)
+local blackBtn = sideButton("black", 1)
+
+local sidePill = round(make("Frame", {
+    Size = UDim2.new(0.5, -1, 1, 0),
+    Position = UDim2.fromOffset(0, 0),
+    BackgroundColor3 = WHITE_PILL,
+    BorderSizePixel = 0,
+    ZIndex = 0,
+    Parent = sideRow,
+}), 10)
+whiteBtn.ZIndex = 2
+blackBtn.ZIndex = 2
+
 -- status ------------------------------------------------------
 local statusRow = make("Frame", {
     Size = UDim2.new(1, 0, 0, 16),
     BackgroundTransparency = 1,
-    LayoutOrder = 2,
+    LayoutOrder = 5,
     Parent = body,
 })
 
@@ -392,7 +761,7 @@ local chip = round(make("Frame", {
     Size = UDim2.new(1, 0, 0, 30),
     BackgroundColor3 = SUNK,
     BorderSizePixel = 0,
-    LayoutOrder = 3,
+    LayoutOrder = 6,
     Parent = body,
 }), 12)
 stroke(chip, STROKE)
@@ -406,7 +775,7 @@ local chipLabel = make("TextLabel", {
     TextColor3 = INK,
     RichText = true,
     TextXAlignment = Enum.TextXAlignment.Left,
-    Text = '<font color="#9e938d">best</font>  –',
+    Text = '<font color="#b07e96">best</font>  –',
     Parent = chip,
 })
 
@@ -418,8 +787,8 @@ local footer = make("TextLabel", {
     TextSize = 10,
     TextColor3 = Color3.fromRGB(138, 128, 123),
     TextXAlignment = Enum.TextXAlignment.Left,
-    Text = "RightShift · drag the top",
-    LayoutOrder = 4,
+    Text = "RightShift · drag the top · 🌸",
+    LayoutOrder = 7,
     Parent = body,
 })
 
@@ -444,11 +813,93 @@ local function setMode(m)
     mode = m == "auto" and "auto" or "hint"
     _G.__pawnpalMode = mode
     refreshSwitch()
+    lastKey = nil -- re-evaluate so switching to auto acts on the current position
+end
+
+local function refreshSpeed()
+    local active, inactive
+    if bullet then active, inactive = bulletBtn, normalBtn else active, inactive = normalBtn, bulletBtn end
+    TweenSvc:Create(speedPill, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+        Position = active.Position,
+        BackgroundColor3 = bullet and AMBER or MINT,
+    }):Play()
+    TweenSvc:Create(active, TweenInfo.new(0.18), { TextColor3 = ON_PILL }):Play()
+    TweenSvc:Create(inactive, TweenInfo.new(0.18), { TextColor3 = MUTED }):Play()
+end
+
+local function setBullet(on)
+    bullet = on and true or false
+    _G.__pawnpalBullet = bullet
+    refreshSpeed()
+    thinkToken = thinkToken + 1 -- drop any in-flight search
+    lastKey = nil               -- re-evaluate with the new timing
+end
+
+local function refreshPlan()
+    local active, inactive
+    if plan then active, inactive = aheadBtn, plainBtn else active, inactive = plainBtn, aheadBtn end
+    TweenSvc:Create(planPill, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+        Position = active.Position,
+        BackgroundColor3 = plan and RED or MINT,
+    }):Play()
+    TweenSvc:Create(active, TweenInfo.new(0.18), { TextColor3 = ON_PILL }):Play()
+    TweenSvc:Create(inactive, TweenInfo.new(0.18), { TextColor3 = MUTED }):Play()
+end
+
+local function setPlan(on)
+    plan = on and true or false
+    _G.__pawnpalPlan = plan
+    refreshPlan()
+    if not plan then
+        pcall(function()
+            if App.board and App.board.setArrow then App.board:setArrow("plan", nil) end
+        end)
+    elseif lastPlan and App.session == lastPlan.session
+           and #App.session.ucis == lastPlan.ply and isOurTurn(App.session) then
+        -- already analysed this position: show the red arrow right away
+        planReply(lastPlan.fen, lastPlan.ucis, lastPlan.best, timing())
+    end
+end
+
+local shownSide = nil
+local function refreshSide()
+    local mine = ourColor(App.session)
+    if mine == shownSide then return end
+    shownSide = mine
+    local active, inactive, pill, ink
+    if mine == 1 then
+        active, inactive, pill, ink = whiteBtn, blackBtn, WHITE_PILL, INK
+    else
+        active, inactive, pill, ink = blackBtn, whiteBtn, BLACK_PILL, ON_PILL
+    end
+    TweenSvc:Create(sidePill, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+        Position = active.Position,
+        BackgroundColor3 = pill,
+    }):Play()
+    TweenSvc:Create(active, TweenInfo.new(0.18), { TextColor3 = ink }):Play()
+    TweenSvc:Create(inactive, TweenInfo.new(0.18), { TextColor3 = MUTED }):Play()
+end
+
+local function setSide(name)
+    sideChoice = (name == "white" or name == "black") and name or nil
+    sideSession = App.session
+    refreshSide()
+    thinkToken = thinkToken + 1
+    lastKey = nil -- re-evaluate from the other side
 end
 
 hintBtn.MouseButton1Click:Connect(function() setMode("hint"); clearArrow() end)
 autoBtn.MouseButton1Click:Connect(function() setMode("auto") end)
+normalBtn.MouseButton1Click:Connect(function() setBullet(false) end)
+bulletBtn.MouseButton1Click:Connect(function() setBullet(true) end)
+plainBtn.MouseButton1Click:Connect(function() setPlan(false) end)
+aheadBtn.MouseButton1Click:Connect(function() setPlan(true) end)
+whiteBtn.MouseButton1Click:Connect(function() setSide("white") end)
+blackBtn.MouseButton1Click:Connect(function() setSide("black") end)
 refreshSwitch()
+refreshSpeed()
+refreshPlan()
+refreshSide()
 
 pcall(function() App.board:deselect() end)
 
@@ -509,27 +960,25 @@ local function setStatus(text, color)
 end
 
 local function showChip(san, ev)
-    chipLabel.Text = string.format('<font color="#9e938d">best</font>  <b>%s</b>  <font color="#5ed9a6">%s</font>', san, ev)
+    chipLabel.Text = string.format('<font color="#b07e96">best</font>  <b>%s</b>  <font color="#e85c98">%s</font>', san, ev)
 end
 
 --=============================================================
 -- main loop
 --=============================================================
-local running = true
-local thinkToken = 0
-local lastKey = nil
-local lastAutoPly = nil
-
 local function scheduleThink(session, key)
     local ply = #session.ucis
     thinkToken = thinkToken + 1
     local token = thinkToken
+    local t = timing()
+    local fen, ucis = session:searchArgs()
     setThinking(true)
-    setStatus(mode == "auto" and "thinking…" or "finding a move…", mode == "auto" and PINK_DEEP or MINT_DEEP)
-    chipLabel.Text = '<font color="#9e938d">best</font>  …'
+    setStatus((bullet and "⚡ " or "") .. (mode == "auto" and "thinking…" or "finding a move…"),
+        mode == "auto" and PINK_DEEP or MINT_DEEP)
+    chipLabel.Text = '<font color="#b07e96">best</font>  …'
 
     task.spawn(function()
-        local res = analyse(session)
+        local res = analyse(fen, ucis, t)
 
         if token ~= thinkToken or not running then return end
         if not res or not res.best then
@@ -553,19 +1002,33 @@ local function scheduleThink(session, key)
         setStatus("your move", MINT_DEEP)
 
         if mode == "auto" and lastAutoPly ~= ply then
-            task.wait(CONFIG.autoDelay)
+            if t.autoDelay > 0 then task.wait(t.autoDelay) end
             if token ~= thinkToken or not running then return end
             if stillValid(session, ply) and lastAutoPly ~= ply then
                 lastAutoPly = ply
-                clickMove(res.best)
+                clickMove(res.best, t)
             end
         end
+
+        -- remember this analysis for the red think-ahead arrow (our follow-up)
+        lastPlan = { session = session, fen = fen, ucis = ucis, best = res.best, ply = ply }
+        if plan then planReply(fen, ucis, res.best, t) end
     end)
 end
 
+local loopSession = nil
 local function loop()
     while running do
         local session = App.session
+
+        -- new game: forget any manual side choice and follow the game again
+        if session ~= loopSession then
+            loopSession = session
+            sideChoice, sideSession = nil, nil
+            lastPlan = nil
+            refreshSide()
+        end
+        refreshSide() -- pill follows session.myColor until a manual choice is made
 
         if session and CONFIG.kinds[session.kind] then
             if session.over then
@@ -573,7 +1036,7 @@ local function loop()
                 setThinking(false)
                 local st = session:status()
                 setStatus(st == "checkmate" and "checkmate — gg" or "game over", MUTED)
-                chipLabel.Text = '<font color="#9e938d">best</font>  –'
+                chipLabel.Text = '<font color="#b07e96">best</font>  –'
                 lastKey = nil
                 lastAutoPly = nil
             elseif session.viewPly ~= #session.ucis then
@@ -581,18 +1044,25 @@ local function loop()
                 setThinking(false)
                 setStatus("reviewing…", MUTED)
                 lastKey = nil
-            elseif session:isMyTurn() then
+            elseif isOurTurn(session) then
                 local key = session.kind .. ":" .. tostring(session.id) .. ":" .. #session.ucis
                 if key ~= lastKey then
                     lastKey = key
                     scheduleThink(session, key)
                 end
             else
-                clearArrow()
+                clearHint()
                 setThinking(false)
                 lastKey = nil
+                -- keep the red plan visible while they think, unless we played something else
+                if lastPlan and lastPlan.session == session then
+                    local uc = session.ucis
+                    if #uc ~= lastPlan.ply + 1 or uc[#uc] ~= lastPlan.best then
+                        pcall(function() App.board:setArrow("plan", nil) end)
+                    end
+                end
                 setStatus(session:status() == "check" and "you're in check" or "waiting for opponent", MUTED)
-                chipLabel.Text = '<font color="#9e938d">best</font>  –'
+                chipLabel.Text = '<font color="#b07e96">best</font>  –'
             end
         else
             clearArrow()
@@ -601,7 +1071,7 @@ local function loop()
             lastKey = nil
         end
 
-        task.wait(0.2)
+        task.wait(bullet and SPEED.bullet.poll or SPEED.normal.poll)
     end
 end
 
@@ -615,12 +1085,19 @@ _G.__pawnpal = {
         running = false
         thinkToken = thinkToken + 1
         if pulseConn then pulseConn:Disconnect() end
+        if petalConn then petalConn:Disconnect() end
         clearArrow()
         gui:Destroy()
         _G.__pawnpal = nil
     end,
     setMode = setMode,
     getMode = function() return mode end,
+    setBullet = setBullet,
+    getBullet = function() return bullet end,
+    setPlan = setPlan,
+    getPlan = function() return plan end,
+    setSide = setSide,
+    getSide = function() return sideChoice, ourColor(App.session) end,
 }
 
 print("[pawnpal] loaded ♟")
